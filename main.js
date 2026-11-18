@@ -284,11 +284,32 @@ function domAncestorPaths(el) {
 	return out;
 }
 
+/* joe: when the cursor is inside an open inline note, find the editor
+ * that holds its [[link]] so hotkeys can close it from within. */
+function enclosingInlineNote(app, innerView) {
+	const wrap = innerView.dom.closest(".inline-note-flow");
+	if (!wrap || !wrap.dataset.linkText) return null;
+	const parentEditorEl = wrap.parentElement && wrap.parentElement.closest(".cm-editor");
+	const parentView = parentEditorEl && EditorView.findFromDOM(parentEditorEl);
+	if (!parentView) return null;
+	const grandWrap = parentEditorEl.closest(".inline-note-flow");
+	const activeFile = app.workspace.getActiveFile();
+	const sourcePath = grandWrap ? grandWrap.dataset.notePath : (activeFile ? activeFile.path : "");
+	return { parentView, linkText: wrap.dataset.linkText, sourcePath };
+}
+
+/* joe: the editor that actually has keyboard focus, else the fallback */
+function focusedEditorView(fallbackView) {
+	const focusedEditorEl = document.activeElement && document.activeElement.closest(".cm-editor");
+	return (focusedEditorEl && EditorView.findFromDOM(focusedEditorEl)) || fallbackView || null;
+}
+
 function buildInlineBody(plugin, linkText, sourcePath, depth, ancestors, parentView) {
 	const app = plugin.app;
 
 	const wrap = document.createElement("div");
 	wrap.className = "inline-note-flow";
+	wrap.dataset.linkText = linkText; // joe: lets commands find the inline note an editor sits inside
 
 	const contentEl = wrap.appendChild(document.createElement("div"));
 	contentEl.className = "inline-note-content";
@@ -904,24 +925,43 @@ class InlineNotePlugin extends Plugin {
 			id: "toggle-inline-note-at-cursor",
 			name: "Toggle inline note for link under cursor",
 			editorCallback: async (editor, ctx) => {
-				const cursor = editor.getCursor();
-				const lineText = editor.getLine(cursor.line);
+				// joe: Obsidian's "active editor" can lag behind where the cursor really is
+				// (it sticks to an inline note after you click back out), so use the focused editor
+				const view = focusedEditorView(editor.cm);
+				if (!view) return;
+				const head = view.state.selection.main.head;
+				const line = view.state.doc.lineAt(head);
+				const cursorCh = head - line.from;
+				const lineText = line.text;
 				LINK_RE.lastIndex = 0;
 				let m;
 				let target = null;
+				let firstLinkOnLine = null; // joe: fall back to the line's first link when the cursor isn't inside one
 				while ((m = LINK_RE.exec(lineText)) !== null) {
 					if (m.index > 0 && lineText[m.index - 1] === "!") continue;
-					if (cursor.ch >= m.index && cursor.ch <= m.index + m[0].length) {
+					if (!firstLinkOnLine) firstLinkOnLine = m[1].trim();
+					if (cursorCh >= m.index && cursorCh <= m.index + m[0].length) {
 						target = m[1].trim();
 						break;
 					}
 				}
+				// joe: no link under the cursor inside an open inline note → close that note
+				const enclosing = !target && enclosingInlineNote(this.app, view);
+				if (enclosing) {
+					this.toggleInlineNote(enclosing.parentView, enclosing.linkText, enclosing.sourcePath, 0);
+					return;
+				}
+				if (!target) target = firstLinkOnLine;
 				if (!target) {
 					new Notice("No [[link]] under cursor.");
 					return;
 				}
-				const sourcePath = (ctx && ctx.file && ctx.file.path) || "";
-				if (editor.cm) this.toggleInlineNote(editor.cm, target, sourcePath, 0);
+				const wrap = view.dom.closest(".inline-note-flow");
+				const activeFile = this.app.workspace.getActiveFile();
+				const sourcePath = wrap && wrap.dataset.notePath
+					? wrap.dataset.notePath
+					: (ctx && ctx.file && ctx.file.path) || (activeFile ? activeFile.path : "");
+				this.toggleInlineNote(view, target, sourcePath, 0);
 			},
 		});
 
@@ -929,8 +969,16 @@ class InlineNotePlugin extends Plugin {
 			id: "collapse-all-inline-notes",
 			name: "Collapse all inline notes",
 			editorCallback: (editor, ctx) => {
-				const sourcePath = (ctx && ctx.file && ctx.file.path) || "";
-				if (editor.cm) this.collapseAllInline(editor.cm, sourcePath);
+				if (!editor.cm) return;
+				// joe: from inside an inline note, climb to the top editor so everything closes
+				let view = editor.cm;
+				let sourcePath = (ctx && ctx.file && ctx.file.path) || "";
+				let enclosing;
+				while ((enclosing = enclosingInlineNote(this.app, view))) {
+					view = enclosing.parentView;
+					sourcePath = enclosing.sourcePath;
+				}
+				this.collapseAllInline(view, sourcePath);
 			},
 		});
 	}
@@ -1106,3 +1154,5 @@ class InlineNotePlugin extends Plugin {
 }
 
 module.exports = InlineNotePlugin;
+
+/* nosourcemap */
